@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     ops::Range,
     pin::Pin,
     sync::{
@@ -42,8 +42,10 @@ use super::{Dataset, fragment::FileFragment, scanner::DatasetRecordBatchStream};
 #[derive(Debug, Default)]
 struct TakeIoStats {
     fragments_touched: AtomicU64,
-    iops: AtomicU64,
-    requests: AtomicU64,
+    physical_iops: AtomicU64,
+    // One per scheduler submission, which may contain multiple physical ranges.
+    scheduler_requests: AtomicU64,
+    // Sum of scheduler range lengths after coalescing/splitting, not wire bytes.
     bytes_read: AtomicU64,
     active_reads: AtomicU64,
     peak_active_reads: AtomicU64,
@@ -54,8 +56,8 @@ struct TakeIoStats {
 #[derive(Debug, Clone, Copy)]
 struct TakeIoSnapshot {
     fragments_touched: u64,
-    iops: u64,
-    requests: u64,
+    physical_iops: u64,
+    scheduler_requests: u64,
     bytes_read: u64,
     peak_active_reads: u64,
     max_queue_time_ns: u64,
@@ -66,30 +68,25 @@ fn duration_ns(duration: Duration) -> u64 {
     duration.as_nanos().min(u64::MAX as u128) as u64
 }
 
-fn current_take_span() -> Option<Span> {
-    let span = Span::current();
-    span.metadata()
-        .is_some_and(|metadata| {
-            metadata.name() == "take" && metadata.fields().field("fragments_touched").is_some()
-        })
-        .then_some(span)
+struct TakeTraceGuard {
+    span: Span,
+    stats: Arc<TakeIoStats>,
+    started_at: Instant,
+    outcome: &'static str,
+    is_recorded: bool,
 }
 
 impl TakeIoStats {
-    fn set_fragments_touched(&self, row_addrs: &[u64]) {
-        let count = row_addrs
-            .iter()
-            .map(|row_addr| RowAddress::from(*row_addr).fragment_id())
-            .collect::<HashSet<_>>()
-            .len() as u64;
-        self.fragments_touched.store(count, Ordering::Relaxed);
+    fn set_fragments_touched(&self, count: usize) {
+        self.fragments_touched
+            .store(count as u64, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> TakeIoSnapshot {
         TakeIoSnapshot {
             fragments_touched: self.fragments_touched.load(Ordering::Relaxed),
-            iops: self.iops.load(Ordering::Relaxed),
-            requests: self.requests.load(Ordering::Relaxed),
+            physical_iops: self.physical_iops.load(Ordering::Relaxed),
+            scheduler_requests: self.scheduler_requests.load(Ordering::Relaxed),
             bytes_read: self.bytes_read.load(Ordering::Relaxed),
             peak_active_reads: self.peak_active_reads.load(Ordering::Relaxed),
             max_queue_time_ns: self.max_queue_time_ns.load(Ordering::Relaxed),
@@ -100,12 +97,20 @@ impl TakeIoStats {
 
 impl IoStatsRecorder for TakeIoStats {
     fn record_request(&self, ranges: &[Range<u64>]) {
-        self.requests.fetch_add(1, Ordering::Relaxed);
-        self.iops.fetch_add(ranges.len() as u64, Ordering::Relaxed);
+        self.scheduler_requests.fetch_add(1, Ordering::Relaxed);
+        self.physical_iops
+            .fetch_add(ranges.len() as u64, Ordering::Relaxed);
         self.bytes_read.fetch_add(
-            ranges.iter().map(|range| range.end - range.start).sum(),
+            ranges
+                .iter()
+                .map(|range| range.end.saturating_sub(range.start))
+                .sum(),
             Ordering::Relaxed,
         );
+    }
+
+    fn records_read_lifecycle(&self) -> bool {
+        true
     }
 
     fn record_read_started(&self, queue_time: Duration) {
@@ -119,6 +124,58 @@ impl IoStatsRecorder for TakeIoStats {
         self.active_reads.fetch_sub(1, Ordering::Relaxed);
         self.max_read_time_ns
             .fetch_max(duration_ns(read_time), Ordering::Relaxed);
+    }
+}
+
+impl TakeTraceGuard {
+    fn new(span: Span) -> Self {
+        Self {
+            span,
+            stats: Arc::new(TakeIoStats::default()),
+            started_at: Instant::now(),
+            outcome: "cancelled",
+            is_recorded: false,
+        }
+    }
+
+    fn stats(&self) -> Arc<TakeIoStats> {
+        self.stats.clone()
+    }
+
+    fn finish<T>(&mut self, result: &Result<T>) {
+        self.outcome = if result.is_ok() { "ok" } else { "error" };
+        self.record();
+    }
+
+    fn record(&mut self) {
+        if self.is_recorded {
+            return;
+        }
+        // Dropping a take records the state visible at cancellation. Standard
+        // scheduler reads already dispatched by the operation may finish later.
+        let stats = self.stats.snapshot();
+        self.span
+            .record("fragments_touched", stats.fragments_touched);
+        self.span.record("physical_iops", stats.physical_iops);
+        self.span
+            .record("scheduler_requests", stats.scheduler_requests);
+        self.span.record("bytes_read", stats.bytes_read);
+        self.span
+            .record("peak_active_reads", stats.peak_active_reads);
+        self.span
+            .record("max_scheduler_queue_time_ns", stats.max_queue_time_ns);
+        self.span
+            .record("max_child_read_time_ns", stats.max_read_time_ns);
+        self.span
+            .record("elapsed_ns", duration_ns(self.started_at.elapsed()));
+        self.span.record("outcome", self.outcome);
+        self.is_recorded = true;
+    }
+}
+
+impl Drop for TakeTraceGuard {
+    fn drop(&mut self) {
+        self.record();
     }
 }
 
@@ -202,24 +259,14 @@ pub async fn take(
     dataset: &Dataset,
     offsets: &[u64],
     projection: ProjectionRequest,
+    span: Option<Span>,
 ) -> Result<RecordBatch> {
-    let span = current_take_span();
-    let io_stats = span.as_ref().map(|_| Arc::new(TakeIoStats::default()));
-    let started_at = span.as_ref().map(|_| Instant::now());
-    let result = execute_take(dataset, offsets, projection, io_stats.clone()).await;
-
-    if let (Some(span), Some(io_stats), Some(started_at)) = (span, io_stats, started_at) {
-        let stats = io_stats.snapshot();
-        span.record("fragments_touched", stats.fragments_touched);
-        span.record("physical_iops", stats.iops);
-        span.record("storage_requests", stats.requests);
-        span.record("bytes_read", stats.bytes_read);
-        span.record("peak_active_reads", stats.peak_active_reads);
-        span.record("max_scheduler_queue_time_ns", stats.max_queue_time_ns);
-        span.record("max_child_read_time_ns", stats.max_read_time_ns);
-        span.record("elapsed_ns", duration_ns(started_at.elapsed()));
+    let mut trace = span.map(TakeTraceGuard::new);
+    let io_stats = trace.as_ref().map(TakeTraceGuard::stats);
+    let result = execute_take(dataset, offsets, projection, io_stats).await;
+    if let Some(trace) = trace.as_mut() {
+        trace.finish(&result);
     }
-
     result
 }
 
@@ -285,10 +332,6 @@ async fn do_take_rows(
 
     let row_addrs = builder.get_row_addrs().await?.clone();
 
-    if let Some(io_stats) = &io_stats {
-        io_stats.set_fragments_touched(&row_addrs);
-    }
-
     if row_addrs.is_empty() {
         // It is possible that `row_id_index` returns None when a fragment has been wholly deleted
         return builder.empty_batch();
@@ -321,8 +364,8 @@ async fn do_take_rows(
         .with_row_created_at_version(with_row_created_at_version_in_projection)
         .with_row_last_updated_at_version(with_row_last_updated_at_version_in_projection)
         .with_ignore_deletions(builder.ignore_deletions);
-    if let Some(io_stats) = io_stats {
-        read_config = read_config.with_io_stats(io_stats);
+    if let Some(io_stats) = &io_stats {
+        read_config = read_config.with_io_stats(io_stats.clone());
     }
     let mut batch = if row_addr_stats.contiguous {
         // Fastest path: Can use `read_range` directly
@@ -338,6 +381,9 @@ async fn do_take_rows(
                 start, fragment_id
             ))
         })?;
+        if let Some(io_stats) = &io_stats {
+            io_stats.set_fragments_touched(1);
+        }
 
         let reader = fragment.open(&physical_schema, read_config).await?;
         reader.read_range_as_batch(range).await
@@ -385,6 +431,9 @@ async fn do_take_rows(
             );
             batches.push(batch_fut);
         }
+        if let Some(io_stats) = &io_stats {
+            io_stats.set_fragments_touched(batches.len());
+        }
         let batches: Vec<RecordBatch> = futures::stream::iter(batches)
             .buffered(builder.dataset.object_store.io_parallelism())
             .try_collect()
@@ -410,6 +459,9 @@ async fn do_take_rows(
 
         let addressed_ids: Vec<u32> = row_addrs_per_fragment.keys().copied().collect();
         let fragments = builder.dataset.get_fragments_from_ids(&addressed_ids)?;
+        if let Some(io_stats) = &io_stats {
+            io_stats.set_fragments_touched(fragments.len());
+        }
         let fragment_and_indices = fragments.into_iter().filter_map(|f| {
             let row_offset = row_addrs_per_fragment.remove(&(f.id() as u32))?;
             Some((f, row_offset))
@@ -777,18 +829,159 @@ mod test {
     use lance_core::utils::deletion::DeletionVector;
     use lance_core::{ROW_ADDR_FIELD, ROW_ID_FIELD};
     use lance_file::version::LanceFileVersion;
-    use lance_io::stream::RecordBatchStream;
+    use lance_io::{object_store::WrappingObjectStore, stream::RecordBatchStream};
     use lance_table::io::deletion::{deletion_file_path, write_deletion_file};
+    use object_store::throttle::ThrottleConfig;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
-    use std::collections::HashMap;
+    use std::{
+        collections::{BTreeMap, HashMap},
+        sync::Mutex,
+    };
+    use tracing::{
+        Event, Id, Level, Subscriber,
+        field::{Field, Visit},
+        span::{Attributes, Record},
+    };
+    use tracing_subscriber::{
+        Layer,
+        filter::LevelFilter,
+        layer::{Context, SubscriberExt},
+    };
 
     use crate::dataset::{
         MergeInsertBuilder, UpdateBuilder, WhenMatched, WhenNotMatched, WriteParams,
         scanner::test_dataset::TestVectorDataset,
     };
+    use crate::utils::test::ThrottledStoreWrapper;
 
     use super::*;
+
+    const TAKE_SUMMARY_FIELDS: [&str; 10] = [
+        "num_rows",
+        "fragments_touched",
+        "physical_iops",
+        "scheduler_requests",
+        "bytes_read",
+        "peak_active_reads",
+        "max_scheduler_queue_time_ns",
+        "max_child_read_time_ns",
+        "elapsed_ns",
+        "outcome",
+    ];
+
+    #[derive(Debug, Default)]
+    struct CapturedTakeSpan {
+        field_names: Vec<String>,
+        values: BTreeMap<String, String>,
+        record_counts: BTreeMap<String, usize>,
+    }
+
+    #[derive(Debug, Default)]
+    struct TakeSpanState {
+        open: HashMap<Id, CapturedTakeSpan>,
+        closed: Vec<CapturedTakeSpan>,
+        error_events: usize,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct TakeSpanCapture(Arc<Mutex<TakeSpanState>>);
+
+    struct FieldCapture<'a> {
+        values: &'a mut BTreeMap<String, String>,
+        record_counts: &'a mut BTreeMap<String, usize>,
+    }
+
+    impl Visit for FieldCapture<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.values.insert(
+                field.name().to_string(),
+                format!("{value:?}").trim_matches('"').to_string(),
+            );
+            *self
+                .record_counts
+                .entry(field.name().to_string())
+                .or_default() += 1;
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.values
+                .insert(field.name().to_string(), value.to_string());
+            *self
+                .record_counts
+                .entry(field.name().to_string())
+                .or_default() += 1;
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.values
+                .insert(field.name().to_string(), value.to_string());
+            *self
+                .record_counts
+                .entry(field.name().to_string())
+                .or_default() += 1;
+        }
+    }
+
+    impl<S> Layer<S> for TakeSpanCapture
+    where
+        S: Subscriber,
+    {
+        fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, _ctx: Context<'_, S>) {
+            if attrs.metadata().name() != "take" {
+                return;
+            }
+            let mut span = CapturedTakeSpan {
+                field_names: attrs
+                    .metadata()
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().to_string())
+                    .collect(),
+                ..Default::default()
+            };
+            attrs.record(&mut FieldCapture {
+                values: &mut span.values,
+                record_counts: &mut span.record_counts,
+            });
+            self.0.lock().unwrap().open.insert(id.clone(), span);
+        }
+
+        fn on_record(&self, id: &Id, values: &Record<'_>, _ctx: Context<'_, S>) {
+            let mut state = self.0.lock().unwrap();
+            let Some(span) = state.open.get_mut(id) else {
+                return;
+            };
+            values.record(&mut FieldCapture {
+                values: &mut span.values,
+                record_counts: &mut span.record_counts,
+            });
+        }
+
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            if *event.metadata().level() == Level::ERROR {
+                self.0.lock().unwrap().error_events += 1;
+            }
+        }
+
+        fn on_close(&self, id: Id, _ctx: Context<'_, S>) {
+            let mut state = self.0.lock().unwrap();
+            if let Some(span) = state.open.remove(&id) {
+                state.closed.push(span);
+            }
+        }
+    }
+
+    impl TakeSpanCapture {
+        fn take_spans(&self) -> Vec<CapturedTakeSpan> {
+            let mut state = self.0.lock().unwrap();
+            std::mem::take(&mut state.closed)
+        }
+
+        fn error_events(&self) -> usize {
+            self.0.lock().unwrap().error_events
+        }
+    }
 
     #[rstest]
     #[case::empty(&[])]
@@ -1042,8 +1235,8 @@ mod test {
         stats.record_read_completed(Duration::from_millis(11));
 
         let snapshot = stats.snapshot();
-        assert_eq!(snapshot.iops, 2);
-        assert_eq!(snapshot.requests, 1);
+        assert_eq!(snapshot.physical_iops, 2);
+        assert_eq!(snapshot.scheduler_requests, 1);
         assert_eq!(snapshot.bytes_read, 15);
         assert_eq!(snapshot.peak_active_reads, 2);
         assert_eq!(snapshot.max_queue_time_ns, 7_000_000);
@@ -1051,74 +1244,179 @@ mod test {
         assert_eq!(stats.active_reads.load(Ordering::Relaxed), 0);
     }
 
-    #[test]
-    fn take_io_stats_require_the_take_span() {
-        tracing::subscriber::with_default(tracing_subscriber::registry(), || {
-            let parent = tracing::info_span!("parent", fragments_touched = tracing::field::Empty);
-            parent.in_scope(|| assert!(current_take_span().is_none()));
-
-            let take = tracing::info_span!("take", fragments_touched = tracing::field::Empty);
-            take.in_scope(|| assert!(current_take_span().is_some()));
-        });
+    async fn take_trace_dataset() -> Dataset {
+        let data = test_batch(0..9);
+        Dataset::write(
+            RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 3,
+                data_storage_version: Some(LanceFileVersion::Stable),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
     }
 
-    #[tokio::test]
-    async fn concurrent_take_io_stats_do_not_mix() {
-        let data = test_batch(0..9);
-        let dataset = Arc::new(
-            Dataset::write(
-                RecordBatchIterator::new([Ok(data.clone())], data.schema()),
-                "memory://",
-                Some(WriteParams {
-                    max_rows_per_file: 3,
-                    data_storage_version: Some(LanceFileVersion::Stable),
-                    ..Default::default()
-                }),
-            )
+    fn assert_take_span(
+        span: &CapturedTakeSpan,
+        outcome: &str,
+        num_rows: usize,
+        fragments_touched: Option<usize>,
+    ) {
+        assert_eq!(
+            span.field_names,
+            TAKE_SUMMARY_FIELDS.map(str::to_string).to_vec()
+        );
+        for field in TAKE_SUMMARY_FIELDS {
+            assert_eq!(span.record_counts.get(field), Some(&1), "field {field}");
+        }
+        assert_eq!(span.values["outcome"], outcome);
+        assert_eq!(span.values["num_rows"], num_rows.to_string());
+        if let Some(fragments_touched) = fragments_touched {
+            assert_eq!(
+                span.values["fragments_touched"],
+                fragments_touched.to_string()
+            );
+        }
+        assert!(span.values["elapsed_ns"].parse::<u64>().unwrap() > 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dataset_take_records_public_success_paths() {
+        let dataset = take_trace_dataset().await;
+        let capture = TakeSpanCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        assert_eq!(
+            dataset
+                .take(&[0, 1], dataset.schema().clone())
+                .await
+                .unwrap()
+                .num_rows(),
+            2
+        );
+        assert_eq!(
+            dataset
+                .take(&[0, 3, 6], dataset.schema().clone())
+                .await
+                .unwrap()
+                .num_rows(),
+            3
+        );
+        assert_eq!(
+            dataset
+                .take(&[6, 0, 3], dataset.schema().clone())
+                .await
+                .unwrap()
+                .num_rows(),
+            3
+        );
+
+        let spans = capture.take_spans();
+        assert_eq!(spans.len(), 3);
+        assert_take_span(&spans[0], "ok", 2, Some(1));
+        assert_take_span(&spans[1], "ok", 3, Some(3));
+        assert_take_span(&spans[2], "ok", 3, Some(3));
+        for span in spans {
+            assert!(span.values["physical_iops"].parse::<u64>().unwrap() > 0);
+            assert!(span.values["scheduler_requests"].parse::<u64>().unwrap() > 0);
+            assert!(span.values["bytes_read"].parse::<u64>().unwrap() > 0);
+            assert!(
+                span.values["max_child_read_time_ns"]
+                    .parse::<u64>()
+                    .unwrap()
+                    > 0
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dataset_take_records_empty_and_error_without_error_events() {
+        let dataset = take_trace_dataset().await;
+        let capture = TakeSpanCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let empty = dataset.take(&[], dataset.schema().clone()).await.unwrap();
+        assert_eq!(empty.num_rows(), 0);
+        let error = dataset
+            .take(&[9], dataset.schema().clone())
             .await
-            .unwrap(),
-        );
-        let projection = Arc::new(
-            ProjectionRequest::Schema(Arc::new(dataset.schema().clone()))
-                .into_projection_plan(dataset.clone())
-                .unwrap(),
-        );
-        let one_fragment = TakeBuilder::try_new_from_addresses(
-            dataset.clone(),
-            vec![u64::from(RowAddress::new_from_parts(0, 0))],
-            projection.clone(),
-        )
-        .unwrap();
-        let two_fragments = TakeBuilder::try_new_from_addresses(
-            dataset,
-            vec![
-                u64::from(RowAddress::new_from_parts(1, 0)),
-                u64::from(RowAddress::new_from_parts(2, 0)),
-            ],
-            projection,
-        )
-        .unwrap();
-        let first_stats = Arc::new(TakeIoStats::default());
-        let second_stats = Arc::new(TakeIoStats::default());
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
 
-        let (first_result, second_result) = tokio::join!(
-            execute_take_rows(one_fragment, Some(first_stats.clone())),
-            execute_take_rows(two_fragments, Some(second_stats.clone())),
-        );
-        assert_eq!(first_result.unwrap().num_rows(), 1);
-        assert_eq!(second_result.unwrap().num_rows(), 2);
+        let spans = capture.take_spans();
+        assert_eq!(spans.len(), 2);
+        assert_take_span(&spans[0], "ok", 0, Some(0));
+        assert_take_span(&spans[1], "error", 1, Some(0));
+        for span in spans {
+            assert_eq!(span.values["physical_iops"], "0");
+            assert_eq!(span.values["scheduler_requests"], "0");
+            assert_eq!(span.values["bytes_read"], "0");
+        }
+        assert_eq!(capture.error_events(), 0);
+    }
 
-        let first = first_stats.snapshot();
-        let second = second_stats.snapshot();
-        assert_eq!(first.fragments_touched, 1);
-        assert_eq!(second.fragments_touched, 2);
-        assert!(first.peak_active_reads >= 1);
-        assert!(second.peak_active_reads >= 1);
-        assert!(second.iops > first.iops);
-        assert!(first.requests > 0);
-        assert!(second.requests > first.requests);
-        assert!(first.bytes_read > 0);
-        assert!(second.bytes_read > first.bytes_read);
+    #[tokio::test(flavor = "current_thread")]
+    async fn dataset_take_records_cancellation_snapshot() {
+        let dataset = take_trace_dataset()
+            .await
+            .with_object_store_wrappers([Arc::new(ThrottledStoreWrapper {
+                config: ThrottleConfig {
+                    wait_get_per_call: Duration::from_millis(200),
+                    ..Default::default()
+                },
+            }) as Arc<dyn WrappingObjectStore>]);
+        let capture = TakeSpanCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let timed_out = tokio::time::timeout(
+            Duration::from_millis(20),
+            dataset.take(&[0], dataset.schema().clone()),
+        )
+        .await;
+        assert!(timed_out.is_err());
+
+        let spans = capture.take_spans();
+        assert_eq!(spans.len(), 1);
+        assert_take_span(&spans[0], "cancelled", 1, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dataset_take_disabled_span_adds_no_summary() {
+        let dataset = take_trace_dataset().await;
+        let capture = TakeSpanCapture::default();
+        let subscriber =
+            tracing_subscriber::registry().with(capture.clone().with_filter(LevelFilter::WARN));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        dataset.take(&[0], dataset.schema().clone()).await.unwrap();
+        assert!(capture.take_spans().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_public_take_summaries_do_not_mix() {
+        let dataset = take_trace_dataset().await;
+        let capture = TakeSpanCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (one_fragment, two_fragments) = tokio::join!(
+            dataset.take(&[0], dataset.schema().clone()),
+            dataset.take(&[3, 6], dataset.schema().clone()),
+        );
+        assert_eq!(one_fragment.unwrap().num_rows(), 1);
+        assert_eq!(two_fragments.unwrap().num_rows(), 2);
+
+        let mut spans = capture.take_spans();
+        spans.sort_by_key(|span| span.values["num_rows"].parse::<usize>().unwrap());
+        assert_eq!(spans.len(), 2);
+        assert_take_span(&spans[0], "ok", 1, Some(1));
+        assert_take_span(&spans[1], "ok", 2, Some(2));
     }
 
     #[rstest]

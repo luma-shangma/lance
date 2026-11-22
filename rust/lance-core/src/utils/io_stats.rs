@@ -23,10 +23,21 @@ use std::{ops::Range, time::Duration};
 /// reader's cached metadata, so measuring costs no extra file opens and does not
 /// disturb the global counters.
 pub trait IoStatsRecorder: std::fmt::Debug + Send + Sync {
-    /// Record one completed request, given the byte ranges as actually
-    /// submitted to storage (i.e. after any coalescing/splitting), so the
-    /// counts reflect physical I/O.
+    /// Record one scheduler request, given the byte ranges as actually
+    /// submitted to storage (i.e. after any coalescing/splitting).
+    ///
+    /// One call counts one scheduler request. Each range counts one physical
+    /// I/O operation, and its length counts scheduler-requested bytes. These
+    /// are not necessarily wire-level requests or bytes.
     fn record_request(&self, ranges: &[Range<u64>]);
+
+    /// Whether this recorder needs per-read queue and execution timings.
+    ///
+    /// The default avoids lifecycle instrumentation for recorders that only
+    /// count scheduler submissions and physical ranges.
+    fn records_read_lifecycle(&self) -> bool {
+        false
+    }
 
     /// Records when one physical read leaves the scheduler queue.
     ///

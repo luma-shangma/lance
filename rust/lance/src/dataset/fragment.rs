@@ -993,7 +993,12 @@ pub struct FragReadConfig {
     /// The scan sets this so every base file it opens shares one scheduler per
     /// base. When absent, a base file falls back to building its own scheduler.
     pub base_schedulers: Option<BaseSchedulers>,
-    /// Optional secondary sink for I/O attributed to this read operation.
+    /// Secondary accounting for v2 file-scheduler reads in this operation.
+    ///
+    /// `Some` records scheduler submissions and their physical ranges without
+    /// replacing the scheduler's primary statistics. `None` adds no accounting.
+    /// Legacy v1 files, deletion vectors, external blob payloads, and uncached
+    /// size probes are outside this sink.
     pub io_stats: Option<Arc<dyn IoStatsRecorder>>,
     /// Read rows as if the fragment had no deletions: the deletion file is not
     /// loaded and deleted rows come back with their stored values. Only for a

@@ -63,7 +63,7 @@ use std::num::NonZero;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
-use tracing::{field::Empty, info, instrument, warn};
+use tracing::{Instrument, field::Empty, info, info_span, instrument, warn};
 
 pub(crate) mod blob;
 pub(crate) mod branch_location;
@@ -2205,27 +2205,28 @@ impl Dataset {
     }
 
     /// Take rows by indices.
-    #[instrument(
-        skip_all,
-        fields(
-            num_rows = row_indices.len(),
-            fragments_touched = Empty,
-            physical_iops = Empty,
-            storage_requests = Empty,
-            bytes_read = Empty,
-            peak_active_reads = Empty,
-            max_scheduler_queue_time_ns = Empty,
-            max_child_read_time_ns = Empty,
-            elapsed_ns = Empty,
-        ),
-        err
-    )]
     pub async fn take(
         &self,
         row_indices: &[u64],
         projection: impl Into<ProjectionRequest>,
     ) -> Result<RecordBatch> {
-        take::take(self, row_indices, projection.into()).await
+        let span = info_span!(
+            "take",
+            num_rows = row_indices.len(),
+            fragments_touched = Empty,
+            physical_iops = Empty,
+            scheduler_requests = Empty,
+            bytes_read = Empty,
+            peak_active_reads = Empty,
+            max_scheduler_queue_time_ns = Empty,
+            max_child_read_time_ns = Empty,
+            elapsed_ns = Empty,
+            outcome = Empty,
+        );
+        let summary_span = (!span.is_disabled()).then(|| span.clone());
+        take::take(self, row_indices, projection.into(), summary_span)
+            .instrument(span)
+            .await
     }
 
     /// Take Rows by the internal ROW ids.
