@@ -1,7 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::BTreeMap, collections::HashMap, ops::Range, pin::Pin, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    ops::Range,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use crate::dataset::fragment::FragReadConfig;
 use crate::dataset::rowids::get_row_id_index_with;
@@ -22,11 +31,96 @@ use lance_arrow::json::convert_lance_json_to_arrow;
 use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::OffsetMapper;
+use lance_core::utils::io_stats::IoStatsRecorder;
 use lance_core::{ROW_ADDR, ROW_OFFSET};
 use lance_datafusion::projection::{OutputColumn, ProjectionPlan};
+use tracing::Span;
 
 use super::ProjectionRequest;
 use super::{Dataset, fragment::FileFragment, scanner::DatasetRecordBatchStream};
+
+#[derive(Debug, Default)]
+struct TakeIoStats {
+    fragments_touched: AtomicU64,
+    iops: AtomicU64,
+    requests: AtomicU64,
+    bytes_read: AtomicU64,
+    active_reads: AtomicU64,
+    peak_active_reads: AtomicU64,
+    max_queue_time_ns: AtomicU64,
+    max_read_time_ns: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TakeIoSnapshot {
+    fragments_touched: u64,
+    iops: u64,
+    requests: u64,
+    bytes_read: u64,
+    peak_active_reads: u64,
+    max_queue_time_ns: u64,
+    max_read_time_ns: u64,
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
+}
+
+fn current_take_span() -> Option<Span> {
+    let span = Span::current();
+    span.metadata()
+        .is_some_and(|metadata| {
+            metadata.name() == "take" && metadata.fields().field("fragments_touched").is_some()
+        })
+        .then_some(span)
+}
+
+impl TakeIoStats {
+    fn set_fragments_touched(&self, row_addrs: &[u64]) {
+        let count = row_addrs
+            .iter()
+            .map(|row_addr| RowAddress::from(*row_addr).fragment_id())
+            .collect::<HashSet<_>>()
+            .len() as u64;
+        self.fragments_touched.store(count, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> TakeIoSnapshot {
+        TakeIoSnapshot {
+            fragments_touched: self.fragments_touched.load(Ordering::Relaxed),
+            iops: self.iops.load(Ordering::Relaxed),
+            requests: self.requests.load(Ordering::Relaxed),
+            bytes_read: self.bytes_read.load(Ordering::Relaxed),
+            peak_active_reads: self.peak_active_reads.load(Ordering::Relaxed),
+            max_queue_time_ns: self.max_queue_time_ns.load(Ordering::Relaxed),
+            max_read_time_ns: self.max_read_time_ns.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl IoStatsRecorder for TakeIoStats {
+    fn record_request(&self, ranges: &[Range<u64>]) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        self.iops.fetch_add(ranges.len() as u64, Ordering::Relaxed);
+        self.bytes_read.fetch_add(
+            ranges.iter().map(|range| range.end - range.start).sum(),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn record_read_started(&self, queue_time: Duration) {
+        let active = self.active_reads.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak_active_reads.fetch_max(active, Ordering::Relaxed);
+        self.max_queue_time_ns
+            .fetch_max(duration_ns(queue_time), Ordering::Relaxed);
+    }
+
+    fn record_read_completed(&self, read_time: Duration) {
+        self.active_reads.fetch_sub(1, Ordering::Relaxed);
+        self.max_read_time_ns
+            .fetch_max(duration_ns(read_time), Ordering::Relaxed);
+    }
+}
 
 /// Convert a list of row offsets to a list of row addresses
 ///
@@ -109,6 +203,32 @@ pub async fn take(
     offsets: &[u64],
     projection: ProjectionRequest,
 ) -> Result<RecordBatch> {
+    let span = current_take_span();
+    let io_stats = span.as_ref().map(|_| Arc::new(TakeIoStats::default()));
+    let started_at = span.as_ref().map(|_| Instant::now());
+    let result = execute_take(dataset, offsets, projection, io_stats.clone()).await;
+
+    if let (Some(span), Some(io_stats), Some(started_at)) = (span, io_stats, started_at) {
+        let stats = io_stats.snapshot();
+        span.record("fragments_touched", stats.fragments_touched);
+        span.record("physical_iops", stats.iops);
+        span.record("storage_requests", stats.requests);
+        span.record("bytes_read", stats.bytes_read);
+        span.record("peak_active_reads", stats.peak_active_reads);
+        span.record("max_scheduler_queue_time_ns", stats.max_queue_time_ns);
+        span.record("max_child_read_time_ns", stats.max_read_time_ns);
+        span.record("elapsed_ns", duration_ns(started_at.elapsed()));
+    }
+
+    result
+}
+
+async fn execute_take(
+    dataset: &Dataset,
+    offsets: &[u64],
+    projection: ProjectionRequest,
+    io_stats: Option<Arc<TakeIoStats>>,
+) -> Result<RecordBatch> {
     let projection = projection.into_projection_plan(Arc::new(dataset.clone()))?;
     if offsets.is_empty() {
         return to_logical_json_batch(RecordBatch::new_empty(Arc::new(
@@ -126,7 +246,7 @@ pub async fn take(
         Arc::new(projection),
     )?;
 
-    take_rows(builder).await
+    execute_take_rows(builder, io_stats).await
 }
 
 /// Take rows by the internal ROW ids.
@@ -134,6 +254,7 @@ pub async fn take(
 async fn do_take_rows(
     mut builder: TakeBuilder,
     projection: Arc<ProjectionPlan>,
+    io_stats: Option<Arc<TakeIoStats>>,
 ) -> Result<RecordBatch> {
     // If we need row addresses in output, add to projection's output expressions
     let projection = if builder.with_row_address {
@@ -164,6 +285,10 @@ async fn do_take_rows(
 
     let row_addrs = builder.get_row_addrs().await?.clone();
 
+    if let Some(io_stats) = &io_stats {
+        io_stats.set_fragments_touched(&row_addrs);
+    }
+
     if row_addrs.is_empty() {
         // It is possible that `row_id_index` returns None when a fragment has been wholly deleted
         return builder.empty_batch();
@@ -190,12 +315,15 @@ async fn do_take_rows(
 
     let physical_schema = Arc::new(projection.physical_projection.to_bare_schema());
     // Keep an internal address so empty and constant projections retain row counts.
-    let read_config = FragReadConfig::default()
+    let mut read_config = FragReadConfig::default()
         .with_row_id(with_row_id_in_projection)
         .with_row_address(with_row_addr_in_projection || projection.physical_projection.is_empty())
         .with_row_created_at_version(with_row_created_at_version_in_projection)
         .with_row_last_updated_at_version(with_row_last_updated_at_version_in_projection)
         .with_ignore_deletions(builder.ignore_deletions);
+    if let Some(io_stats) = io_stats {
+        read_config = read_config.with_io_stats(io_stats);
+    }
     let mut batch = if row_addr_stats.contiguous {
         // Fastest path: Can use `read_range` directly
         let start = row_addrs.first().expect("empty range passed to take_rows");
@@ -373,14 +501,16 @@ async fn do_take_rows(
     to_logical_json_batch(projection.project_batch(batch).await?)
 }
 
-async fn take_rows(builder: TakeBuilder) -> Result<RecordBatch> {
+async fn execute_take_rows(
+    builder: TakeBuilder,
+    io_stats: Option<Arc<TakeIoStats>>,
+) -> Result<RecordBatch> {
     if builder.is_empty() {
         return builder.empty_batch();
     }
 
     let projection = builder.projection.clone();
-
-    do_take_rows(builder, projection).await
+    do_take_rows(builder, projection, io_stats).await
 }
 
 fn to_logical_json_batch(batch: RecordBatch) -> Result<RecordBatch> {
@@ -540,7 +670,7 @@ impl TakeBuilder {
 
     /// Execute the take operation and return a single batch
     pub async fn execute(self) -> Result<RecordBatch> {
-        take_rows(self).await
+        execute_take_rows(self, None).await
     }
 
     pub fn is_empty(&self) -> bool {
@@ -900,6 +1030,95 @@ mod test {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn take_io_stats_track_peaks_and_maxima() {
+        let stats = TakeIoStats::default();
+        stats.record_request(&[0..10, 20..25]);
+        stats.record_read_started(Duration::from_millis(7));
+        stats.record_read_started(Duration::from_millis(3));
+        stats.record_read_completed(Duration::from_millis(5));
+        stats.record_read_completed(Duration::from_millis(11));
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.iops, 2);
+        assert_eq!(snapshot.requests, 1);
+        assert_eq!(snapshot.bytes_read, 15);
+        assert_eq!(snapshot.peak_active_reads, 2);
+        assert_eq!(snapshot.max_queue_time_ns, 7_000_000);
+        assert_eq!(snapshot.max_read_time_ns, 11_000_000);
+        assert_eq!(stats.active_reads.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn take_io_stats_require_the_take_span() {
+        tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+            let parent = tracing::info_span!("parent", fragments_touched = tracing::field::Empty);
+            parent.in_scope(|| assert!(current_take_span().is_none()));
+
+            let take = tracing::info_span!("take", fragments_touched = tracing::field::Empty);
+            take.in_scope(|| assert!(current_take_span().is_some()));
+        });
+    }
+
+    #[tokio::test]
+    async fn concurrent_take_io_stats_do_not_mix() {
+        let data = test_batch(0..9);
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new([Ok(data.clone())], data.schema()),
+                "memory://",
+                Some(WriteParams {
+                    max_rows_per_file: 3,
+                    data_storage_version: Some(LanceFileVersion::Stable),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+        let projection = Arc::new(
+            ProjectionRequest::Schema(Arc::new(dataset.schema().clone()))
+                .into_projection_plan(dataset.clone())
+                .unwrap(),
+        );
+        let one_fragment = TakeBuilder::try_new_from_addresses(
+            dataset.clone(),
+            vec![u64::from(RowAddress::new_from_parts(0, 0))],
+            projection.clone(),
+        )
+        .unwrap();
+        let two_fragments = TakeBuilder::try_new_from_addresses(
+            dataset,
+            vec![
+                u64::from(RowAddress::new_from_parts(1, 0)),
+                u64::from(RowAddress::new_from_parts(2, 0)),
+            ],
+            projection,
+        )
+        .unwrap();
+        let first_stats = Arc::new(TakeIoStats::default());
+        let second_stats = Arc::new(TakeIoStats::default());
+
+        let (first_result, second_result) = tokio::join!(
+            execute_take_rows(one_fragment, Some(first_stats.clone())),
+            execute_take_rows(two_fragments, Some(second_stats.clone())),
+        );
+        assert_eq!(first_result.unwrap().num_rows(), 1);
+        assert_eq!(second_result.unwrap().num_rows(), 2);
+
+        let first = first_stats.snapshot();
+        let second = second_stats.snapshot();
+        assert_eq!(first.fragments_touched, 1);
+        assert_eq!(second.fragments_touched, 2);
+        assert!(first.peak_active_reads >= 1);
+        assert!(second.peak_active_reads >= 1);
+        assert!(second.iops > first.iops);
+        assert!(first.requests > 0);
+        assert!(second.requests > first.requests);
+        assert!(first.bytes_read > 0);
+        assert!(second.bytes_read > first.bytes_read);
     }
 
     #[rstest]

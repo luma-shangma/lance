@@ -29,6 +29,7 @@ use lance_core::datatypes::{
     BlobHandling, NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
 };
 use lance_core::utils::deletion::DeletionVector;
+use lance_core::utils::io_stats::IoStatsRecorder;
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::{
     Error, Result,
@@ -992,6 +993,8 @@ pub struct FragReadConfig {
     /// The scan sets this so every base file it opens shares one scheduler per
     /// base. When absent, a base file falls back to building its own scheduler.
     pub base_schedulers: Option<BaseSchedulers>,
+    /// Optional secondary sink for I/O attributed to this read operation.
+    pub io_stats: Option<Arc<dyn IoStatsRecorder>>,
     /// Read rows as if the fragment had no deletions: the deletion file is not
     /// loaded and deleted rows come back with their stored values. Only for a
     /// caller that knows the rows it asks for are live.
@@ -1073,6 +1076,11 @@ impl FragReadConfig {
 
     pub fn with_base_schedulers(mut self, value: BaseSchedulers) -> Self {
         self.base_schedulers = Some(value);
+        self
+    }
+
+    pub fn with_io_stats(mut self, value: Arc<dyn IoStatsRecorder>) -> Self {
+        self.io_stats = Some(value);
         self
     }
 }
@@ -1713,6 +1721,10 @@ impl FileFragment {
                 .with_priority(reader_priority as u64)
                 .with_block_size(0)
                 .with_metadata_read_size(lance_file::reader::FOOTER_LEN)?
+        };
+        let file_scheduler = match read_config.io_stats.as_ref() {
+            Some(stats) => file_scheduler.with_io_stats(stats.clone()),
+            None => file_scheduler,
         };
         let path = file_scheduler.reader().path().clone();
         let metadata_cache = self.dataset.metadata_cache.file_metadata_cache(&path);

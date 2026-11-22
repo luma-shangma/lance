@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::ops::Range;
+use std::{ops::Range, time::Duration};
 
 /// A sink that records I/O requests as they are submitted to storage.
 ///
@@ -27,4 +27,17 @@ pub trait IoStatsRecorder: std::fmt::Debug + Send + Sync {
     /// submitted to storage (i.e. after any coalescing/splitting), so the
     /// counts reflect physical I/O.
     fn record_request(&self, ranges: &[Range<u64>]);
+
+    /// Records when one physical read leaves the scheduler queue.
+    ///
+    /// `queue_time` covers time from submission until the scheduler starts the
+    /// storage read. Implementors that only need request counts can keep the
+    /// default no-op.
+    fn record_read_started(&self, _queue_time: Duration) {}
+
+    /// Records when one admitted physical read finishes or is cancelled.
+    ///
+    /// `read_time` starts when the scheduler starts the storage read.
+    /// Implementors that only need request counts can keep the default no-op.
+    fn record_read_completed(&self, _read_time: Duration) {}
 }

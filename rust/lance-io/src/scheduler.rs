@@ -3,7 +3,7 @@
 
 use bytes::Bytes;
 use futures::channel::oneshot;
-use futures::future::Either;
+use futures::future::{BoxFuture, Either};
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt, TryFutureExt};
 use object_store::path::Path;
@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 use tokio::sync::Notify;
 
+use lance_core::deepsize::{Context as DeepSizeContext, DeepSizeOf};
 use lance_core::memory::{Component, register_component};
 use lance_core::utils::io_stats::IoStatsRecorder;
 use lance_core::utils::parse::str_is_truthy;
@@ -49,6 +50,104 @@ pub fn iops_counter() -> u64 {
 
 pub fn bytes_read_counter() -> u64 {
     BYTES_READ_COUNTER.load(Ordering::Acquire)
+}
+
+#[derive(Debug)]
+struct ReadObservation {
+    stats: Arc<dyn IoStatsRecorder>,
+    timestamp: Instant,
+    started: bool,
+}
+
+#[derive(Debug)]
+struct ObservedReader {
+    inner: Arc<dyn Reader>,
+    observation: Mutex<Option<ReadObservation>>,
+}
+
+impl ObservedReader {
+    fn new(inner: Arc<dyn Reader>, stats: Arc<dyn IoStatsRecorder>) -> Self {
+        Self {
+            inner,
+            observation: Mutex::new(ReadObservation::pending(Some(stats))),
+        }
+    }
+}
+
+impl DeepSizeOf for ObservedReader {
+    fn deep_size_of_children(&self, context: &mut DeepSizeContext) -> usize {
+        self.inner.deep_size_of_children(context)
+    }
+}
+
+impl Reader for ObservedReader {
+    fn path(&self) -> &Path {
+        self.inner.path()
+    }
+
+    fn block_size(&self) -> usize {
+        self.inner.block_size()
+    }
+
+    fn io_parallelism(&self) -> usize {
+        self.inner.io_parallelism()
+    }
+
+    fn size(&self) -> BoxFuture<'_, object_store::Result<usize>> {
+        self.inner.size()
+    }
+
+    fn get_range(&self, range: Range<usize>) -> BoxFuture<'static, object_store::Result<Bytes>> {
+        let mut observation = self.observation.lock().unwrap().take();
+        if let Some(observation) = observation.as_mut() {
+            observation.start();
+        }
+        let read = self.inner.get_range(range);
+        Box::pin(async move {
+            let result = read.await;
+            drop(observation);
+            result
+        })
+    }
+
+    fn get_all(&self) -> BoxFuture<'_, object_store::Result<Bytes>> {
+        self.inner.get_all()
+    }
+}
+
+fn observed_reader(
+    reader: Arc<dyn Reader>,
+    stats: Option<Arc<dyn IoStatsRecorder>>,
+) -> Arc<dyn Reader> {
+    match stats {
+        Some(stats) => Arc::new(ObservedReader::new(reader, stats)),
+        None => reader,
+    }
+}
+
+impl ReadObservation {
+    fn pending(stats: Option<Arc<dyn IoStatsRecorder>>) -> Option<Self> {
+        stats.map(|stats| Self {
+            stats,
+            timestamp: Instant::now(),
+            started: false,
+        })
+    }
+
+    fn start(&mut self) {
+        debug_assert!(!self.started);
+        self.stats.record_read_started(self.timestamp.elapsed());
+        self.timestamp = Instant::now();
+        self.started = true;
+    }
+}
+
+impl Drop for ReadObservation {
+    fn drop(&mut self) {
+        if self.started {
+            self.stats.record_read_completed(self.timestamp.elapsed());
+        }
+    }
 }
 
 // We want to allow requests that have a lower priority than any
@@ -909,6 +1008,12 @@ pub(crate) enum SchedulerErrorMode {
     FailFast,
 }
 
+struct SubmitRequestOptions {
+    bypass_backpressure: bool,
+    error_mode: SchedulerErrorMode,
+    extra_stats: Option<Arc<dyn IoStatsRecorder>>,
+}
+
 impl FromStr for SchedulerErrorMode {
     type Err = Error;
 
@@ -1174,11 +1279,10 @@ impl ScanScheduler {
         tx: oneshot::Sender<Response>,
         priority: u128,
         io_queue: &Arc<IoQueue>,
-        bypass_backpressure: bool,
-        error_mode: SchedulerErrorMode,
+        options: SubmitRequestOptions,
     ) {
         let num_iops = request.len() as u32;
-        let request_cancellation = (error_mode == SchedulerErrorMode::FailFast)
+        let request_cancellation = (options.error_mode == SchedulerErrorMode::FailFast)
             .then(|| Arc::new(RequestCancellation::new()));
 
         let when_all_io_done = move |bytes_and_permits| {
@@ -1190,7 +1294,7 @@ impl ScanScheduler {
             when_all_io_done,
             num_iops,
             priority,
-            bypass_backpressure,
+            options.bypass_backpressure,
             io_queue.clone(),
         ))));
 
@@ -1201,10 +1305,10 @@ impl ScanScheduler {
             let callback_cancellation = request_cancellation.clone();
             let num_bytes = iop.end - iop.start;
             let task = IoTask {
-                reader: reader.clone(),
+                reader: observed_reader(reader.clone(), options.extra_stats.clone()),
                 to_read: iop,
                 priority,
-                bypass_backpressure,
+                bypass_backpressure: options.bypass_backpressure,
                 when_done: Box::new(move |data, was_admitted| {
                     let has_error = data.is_err();
                     let is_fail_fast = callback_cancellation.is_some();
@@ -1247,6 +1351,7 @@ impl ScanScheduler {
         priority: u128,
         io_queue: &Arc<IoQueue>,
         bypass_backpressure: bool,
+        extra_stats: Option<Arc<dyn IoStatsRecorder>>,
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
         let (tx, rx) = oneshot::channel::<Response>();
         Self::do_submit_request(
@@ -1255,8 +1360,11 @@ impl ScanScheduler {
             tx,
             priority,
             io_queue,
-            bypass_backpressure,
-            self.error_mode,
+            SubmitRequestOptions {
+                bypass_backpressure,
+                error_mode: self.error_mode,
+                extra_stats,
+            },
         );
         rx.map(|wrapped_rsp| {
             // A cancel error can't occur: the sender always sends before dropping.
@@ -1273,13 +1381,14 @@ impl ScanScheduler {
         priority: u128,
         io_queue: &Arc<lite::IoQueue>,
         bypass_backpressure: bool,
+        extra_stats: Option<Arc<dyn IoStatsRecorder>>,
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
         let error_mode = self.error_mode;
         // It's important that we submit all requests _before_ we await anything
         let maybe_tasks = request
             .into_iter()
             .map(|task| {
-                let reader = reader.clone();
+                let reader = observed_reader(reader.clone(), extra_stats.clone());
                 let queue = io_queue.clone();
                 let requested_range = task.clone();
                 let run_fn = Box::new(move || {
@@ -1335,12 +1444,13 @@ impl ScanScheduler {
         }
     }
 
-    pub fn submit_request(
+    fn submit_request_with_stats(
         &self,
         reader: Arc<dyn Reader>,
         request: Vec<Range<u64>>,
         priority: u128,
         bypass_backpressure: bool,
+        extra_stats: Option<Arc<dyn IoStatsRecorder>>,
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
         match &self.io_queue {
             IoQueueType::Standard(io_queue) => {
@@ -1350,12 +1460,30 @@ impl ScanScheduler {
                     priority,
                     io_queue,
                     bypass_backpressure,
+                    extra_stats,
                 ))
             }
-            IoQueueType::Lite(io_queue) => futures::future::Either::Right(
-                self.submit_request_lite(reader, request, priority, io_queue, bypass_backpressure),
-            ),
+            IoQueueType::Lite(io_queue) => {
+                futures::future::Either::Right(self.submit_request_lite(
+                    reader,
+                    request,
+                    priority,
+                    io_queue,
+                    bypass_backpressure,
+                    extra_stats,
+                ))
+            }
         }
+    }
+
+    pub fn submit_request(
+        &self,
+        reader: Arc<dyn Reader>,
+        request: Vec<Range<u64>>,
+        priority: u128,
+        bypass_backpressure: bool,
+    ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
+        self.submit_request_with_stats(reader, request, priority, bypass_backpressure, None)
     }
 
     pub fn stats(&self) -> ScanStats {
@@ -1492,11 +1620,12 @@ impl FileScheduler {
             extra_stats.record_request(&updated_requests);
         }
 
-        let bytes_vec_fut = self.root.submit_request(
+        let bytes_vec_fut = self.root.submit_request_with_stats(
             self.reader.clone(),
             updated_requests.clone(),
             priority,
             self.bypass_backpressure,
+            self.extra_stats.clone(),
         );
 
         let mut updated_index = 0;
@@ -2237,6 +2366,72 @@ mod tests {
         assert_eq!(global.bytes_read + 1000, global_after.bytes_read);
         assert_eq!(scoped.bytes_read, scoped_after.bytes_read);
         assert_eq!(scoped.iops, scoped_after.iops);
+    }
+
+    #[derive(Debug, Default)]
+    struct ReadLifecycleStats {
+        iops: AtomicU64,
+        requests: AtomicU64,
+        started: AtomicU64,
+        completed: AtomicU64,
+    }
+
+    impl IoStatsRecorder for ReadLifecycleStats {
+        fn record_request(&self, ranges: &[Range<u64>]) {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            self.iops.fetch_add(ranges.len() as u64, Ordering::Relaxed);
+        }
+
+        fn record_read_started(&self, _queue_time: Duration) {
+            self.started.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn record_read_completed(&self, _read_time: Duration) {
+            self.completed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[rstest]
+    #[case::standard(false)]
+    #[case::lite(true)]
+    #[tokio::test]
+    async fn concurrent_io_stats_sinks_do_not_mix(#[case] use_lite_scheduler: bool) {
+        let path = Path::parse("concurrent-stats").unwrap();
+        let object_store = Arc::new(ObjectStore::memory());
+        object_store.put(&path, &vec![0; 16_000]).await.unwrap();
+        let scheduler = ScanScheduler::new(
+            object_store,
+            SchedulerConfig {
+                use_lite_scheduler: Some(use_lite_scheduler),
+                ..SchedulerConfig::default_for_testing()
+            },
+        );
+        let file = scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap()
+            .with_block_size(0);
+        let first = Arc::new(ReadLifecycleStats::default());
+        let second = Arc::new(ReadLifecycleStats::default());
+
+        let first_read = file
+            .with_io_stats(first.clone())
+            .submit_request(vec![0..1_000], 0);
+        let second_read = file
+            .with_io_stats(second.clone())
+            .submit_request(vec![2_000..3_000, 10_000..11_000], 0);
+        let (first_result, second_result) = tokio::join!(first_read, second_read);
+        first_result.unwrap();
+        second_result.unwrap();
+
+        assert_eq!(first.requests.load(Ordering::Relaxed), 1);
+        assert_eq!(first.iops.load(Ordering::Relaxed), 1);
+        assert_eq!(first.started.load(Ordering::Relaxed), 1);
+        assert_eq!(first.completed.load(Ordering::Relaxed), 1);
+        assert_eq!(second.requests.load(Ordering::Relaxed), 1);
+        assert_eq!(second.iops.load(Ordering::Relaxed), 2);
+        assert_eq!(second.started.load(Ordering::Relaxed), 2);
+        assert_eq!(second.completed.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
