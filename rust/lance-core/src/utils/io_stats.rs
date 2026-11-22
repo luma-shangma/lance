@@ -31,6 +31,23 @@ pub trait IoStatsRecorder: std::fmt::Debug + Send + Sync {
     /// are not necessarily wire-level requests or bytes.
     fn record_request(&self, ranges: &[Range<u64>]);
 
+    /// Record one scheduler request before and after range transformation.
+    ///
+    /// `logical_ranges` are the sorted ranges requested by the decoder.
+    /// `physical_ranges` are the ranges submitted to storage after the file
+    /// scheduler has coalesced nearby ranges and split oversized ranges.  The
+    /// default preserves the existing physical-I/O-only contract.
+    ///
+    /// Implementors that need coalescing diagnostics can override this method
+    /// without making every recorder pay to inspect logical ranges.
+    fn record_request_transform(
+        &self,
+        _logical_ranges: &[Range<u64>],
+        physical_ranges: &[Range<u64>],
+    ) {
+        self.record_request(physical_ranges);
+    }
+
     /// Whether this recorder needs per-read queue and execution timings.
     ///
     /// The default avoids lifecycle instrumentation for recorders that only

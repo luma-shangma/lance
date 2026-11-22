@@ -42,11 +42,19 @@ use super::{Dataset, fragment::FileFragment, scanner::DatasetRecordBatchStream};
 #[derive(Debug, Default)]
 struct TakeIoStats {
     fragments_touched: AtomicU64,
+    // Decoder ranges before the file scheduler coalesces or splits them.
+    logical_ranges: AtomicU64,
+    // Sum of logical range lengths. Overlapping bytes are counted repeatedly.
+    logical_requested_bytes: AtomicU64,
+    // Union of logical ranges within each scheduler request.
+    logical_union_bytes: AtomicU64,
     physical_iops: AtomicU64,
     // One per scheduler submission, which may contain multiple physical ranges.
     scheduler_requests: AtomicU64,
     // Sum of scheduler range lengths after coalescing/splitting, not wire bytes.
-    bytes_read: AtomicU64,
+    physical_bytes: AtomicU64,
+    // Bytes fetched beyond the union of the logical ranges, summed per request.
+    overfetch_bytes: AtomicU64,
     active_reads: AtomicU64,
     peak_active_reads: AtomicU64,
     max_queue_time_ns: AtomicU64,
@@ -56,9 +64,15 @@ struct TakeIoStats {
 #[derive(Debug, Clone, Copy)]
 struct TakeIoSnapshot {
     fragments_touched: u64,
+    logical_ranges: u64,
+    logical_requested_bytes: u64,
+    logical_union_bytes: u64,
     physical_iops: u64,
     scheduler_requests: u64,
-    bytes_read: u64,
+    physical_bytes: u64,
+    overfetch_bytes: u64,
+    overfetch_ratio: f64,
+    coalescing_ratio: f64,
     peak_active_reads: u64,
     max_queue_time_ns: u64,
     max_read_time_ns: u64,
@@ -83,11 +97,21 @@ impl TakeIoStats {
     }
 
     fn snapshot(&self) -> TakeIoSnapshot {
+        let logical_ranges = self.logical_ranges.load(Ordering::Relaxed);
+        let logical_union_bytes = self.logical_union_bytes.load(Ordering::Relaxed);
+        let physical_iops = self.physical_iops.load(Ordering::Relaxed);
+        let overfetch_bytes = self.overfetch_bytes.load(Ordering::Relaxed);
         TakeIoSnapshot {
             fragments_touched: self.fragments_touched.load(Ordering::Relaxed),
-            physical_iops: self.physical_iops.load(Ordering::Relaxed),
+            logical_ranges,
+            logical_requested_bytes: self.logical_requested_bytes.load(Ordering::Relaxed),
+            logical_union_bytes,
+            physical_iops,
             scheduler_requests: self.scheduler_requests.load(Ordering::Relaxed),
-            bytes_read: self.bytes_read.load(Ordering::Relaxed),
+            physical_bytes: self.physical_bytes.load(Ordering::Relaxed),
+            overfetch_bytes,
+            overfetch_ratio: ratio(overfetch_bytes, logical_union_bytes),
+            coalescing_ratio: ratio(logical_ranges, physical_iops),
             peak_active_reads: self.peak_active_reads.load(Ordering::Relaxed),
             max_queue_time_ns: self.max_queue_time_ns.load(Ordering::Relaxed),
             max_read_time_ns: self.max_read_time_ns.load(Ordering::Relaxed),
@@ -97,14 +121,29 @@ impl TakeIoStats {
 
 impl IoStatsRecorder for TakeIoStats {
     fn record_request(&self, ranges: &[Range<u64>]) {
+        self.record_request_transform(ranges, ranges);
+    }
+
+    fn record_request_transform(
+        &self,
+        logical_ranges: &[Range<u64>],
+        physical_ranges: &[Range<u64>],
+    ) {
         self.scheduler_requests.fetch_add(1, Ordering::Relaxed);
+        self.logical_ranges
+            .fetch_add(logical_ranges.len() as u64, Ordering::Relaxed);
+        self.logical_requested_bytes
+            .fetch_add(ranges_bytes(logical_ranges), Ordering::Relaxed);
+        let logical_union_bytes = union_bytes(logical_ranges);
+        self.logical_union_bytes
+            .fetch_add(logical_union_bytes, Ordering::Relaxed);
         self.physical_iops
-            .fetch_add(ranges.len() as u64, Ordering::Relaxed);
-        self.bytes_read.fetch_add(
-            ranges
-                .iter()
-                .map(|range| range.end.saturating_sub(range.start))
-                .sum(),
+            .fetch_add(physical_ranges.len() as u64, Ordering::Relaxed);
+        let physical_bytes = ranges_bytes(physical_ranges);
+        self.physical_bytes
+            .fetch_add(physical_bytes, Ordering::Relaxed);
+        self.overfetch_bytes.fetch_add(
+            physical_bytes.saturating_sub(logical_union_bytes),
             Ordering::Relaxed,
         );
     }
@@ -124,6 +163,42 @@ impl IoStatsRecorder for TakeIoStats {
         self.active_reads.fetch_sub(1, Ordering::Relaxed);
         self.max_read_time_ns
             .fetch_max(duration_ns(read_time), Ordering::Relaxed);
+    }
+}
+
+fn range_len(range: &Range<u64>) -> u64 {
+    range.end.saturating_sub(range.start)
+}
+
+fn ranges_bytes(ranges: &[Range<u64>]) -> u64 {
+    ranges
+        .iter()
+        .fold(0_u64, |total, range| total.saturating_add(range_len(range)))
+}
+
+/// Return the number of distinct bytes covered by sorted ranges.
+fn union_bytes(ranges: &[Range<u64>]) -> u64 {
+    let Some(first) = ranges.first() else {
+        return 0;
+    };
+    let mut total = 0_u64;
+    let mut current = first.clone();
+    for range in &ranges[1..] {
+        if range.start <= current.end {
+            current.end = current.end.max(range.end);
+        } else {
+            total = total.saturating_add(range_len(&current));
+            current = range.clone();
+        }
+    }
+    total.saturating_add(range_len(&current))
+}
+
+fn ratio(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
     }
 }
 
@@ -156,10 +231,18 @@ impl TakeTraceGuard {
         let stats = self.stats.snapshot();
         self.span
             .record("fragments_touched", stats.fragments_touched);
+        self.span.record("logical_ranges", stats.logical_ranges);
+        self.span
+            .record("logical_requested_bytes", stats.logical_requested_bytes);
+        self.span
+            .record("logical_union_bytes", stats.logical_union_bytes);
         self.span.record("physical_iops", stats.physical_iops);
         self.span
             .record("scheduler_requests", stats.scheduler_requests);
-        self.span.record("bytes_read", stats.bytes_read);
+        self.span.record("physical_bytes", stats.physical_bytes);
+        self.span.record("overfetch_bytes", stats.overfetch_bytes);
+        self.span.record("overfetch_ratio", stats.overfetch_ratio);
+        self.span.record("coalescing_ratio", stats.coalescing_ratio);
         self.span
             .record("peak_active_reads", stats.peak_active_reads);
         self.span
@@ -857,12 +940,18 @@ mod test {
 
     use super::*;
 
-    const TAKE_SUMMARY_FIELDS: [&str; 10] = [
+    const TAKE_SUMMARY_FIELDS: [&str; 16] = [
         "num_rows",
         "fragments_touched",
+        "logical_ranges",
+        "logical_requested_bytes",
+        "logical_union_bytes",
         "physical_iops",
         "scheduler_requests",
-        "bytes_read",
+        "physical_bytes",
+        "overfetch_bytes",
+        "overfetch_ratio",
+        "coalescing_ratio",
         "peak_active_reads",
         "max_scheduler_queue_time_ns",
         "max_child_read_time_ns",
@@ -905,6 +994,15 @@ mod test {
         }
 
         fn record_u64(&mut self, field: &Field, value: u64) {
+            self.values
+                .insert(field.name().to_string(), value.to_string());
+            *self
+                .record_counts
+                .entry(field.name().to_string())
+                .or_default() += 1;
+        }
+
+        fn record_f64(&mut self, field: &Field, value: f64) {
             self.values
                 .insert(field.name().to_string(), value.to_string());
             *self
@@ -1228,16 +1326,22 @@ mod test {
     #[test]
     fn take_io_stats_track_peaks_and_maxima() {
         let stats = TakeIoStats::default();
-        stats.record_request(&[0..10, 20..25]);
+        stats.record_request_transform(&[0..10, 5..15, 20..25, 20..25], &[0..25]);
         stats.record_read_started(Duration::from_millis(7));
         stats.record_read_started(Duration::from_millis(3));
         stats.record_read_completed(Duration::from_millis(5));
         stats.record_read_completed(Duration::from_millis(11));
 
         let snapshot = stats.snapshot();
-        assert_eq!(snapshot.physical_iops, 2);
+        assert_eq!(snapshot.logical_ranges, 4);
+        assert_eq!(snapshot.logical_requested_bytes, 30);
+        assert_eq!(snapshot.logical_union_bytes, 20);
+        assert_eq!(snapshot.physical_iops, 1);
         assert_eq!(snapshot.scheduler_requests, 1);
-        assert_eq!(snapshot.bytes_read, 15);
+        assert_eq!(snapshot.physical_bytes, 25);
+        assert_eq!(snapshot.overfetch_bytes, 5);
+        assert_eq!(snapshot.overfetch_ratio, 0.25);
+        assert_eq!(snapshot.coalescing_ratio, 4.0);
         assert_eq!(snapshot.peak_active_reads, 2);
         assert_eq!(snapshot.max_queue_time_ns, 7_000_000);
         assert_eq!(snapshot.max_read_time_ns, 11_000_000);
@@ -1321,9 +1425,19 @@ mod test {
         assert_take_span(&spans[1], "ok", 3, Some(3));
         assert_take_span(&spans[2], "ok", 3, Some(3));
         for span in spans {
+            assert!(span.values["logical_ranges"].parse::<u64>().unwrap() > 0);
+            assert!(
+                span.values["logical_requested_bytes"]
+                    .parse::<u64>()
+                    .unwrap()
+                    > 0
+            );
+            assert!(span.values["logical_union_bytes"].parse::<u64>().unwrap() > 0);
             assert!(span.values["physical_iops"].parse::<u64>().unwrap() > 0);
             assert!(span.values["scheduler_requests"].parse::<u64>().unwrap() > 0);
-            assert!(span.values["bytes_read"].parse::<u64>().unwrap() > 0);
+            assert!(span.values["physical_bytes"].parse::<u64>().unwrap() > 0);
+            assert!(span.values["overfetch_ratio"].parse::<f64>().unwrap() >= 0.0);
+            assert!(span.values["coalescing_ratio"].parse::<f64>().unwrap() > 0.0);
             assert!(
                 span.values["max_child_read_time_ns"]
                     .parse::<u64>()
@@ -1353,9 +1467,15 @@ mod test {
         assert_take_span(&spans[0], "ok", 0, Some(0));
         assert_take_span(&spans[1], "error", 1, Some(0));
         for span in spans {
+            assert_eq!(span.values["logical_ranges"], "0");
+            assert_eq!(span.values["logical_requested_bytes"], "0");
+            assert_eq!(span.values["logical_union_bytes"], "0");
             assert_eq!(span.values["physical_iops"], "0");
             assert_eq!(span.values["scheduler_requests"], "0");
-            assert_eq!(span.values["bytes_read"], "0");
+            assert_eq!(span.values["physical_bytes"], "0");
+            assert_eq!(span.values["overfetch_bytes"], "0");
+            assert_eq!(span.values["overfetch_ratio"], "0");
+            assert_eq!(span.values["coalescing_ratio"], "0");
         }
         assert_eq!(capture.error_events(), 0);
     }

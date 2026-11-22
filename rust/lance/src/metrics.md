@@ -54,6 +54,23 @@ bitmap batch `output_rows` is not a logical candidate count. Search-specific
 comparisons retain their producer-specific meaning; no per-document FTS counters
 are added.
 
+When the `take` tracing span is enabled, `Dataset::take` also records an
+operation-local range summary. `logical_ranges` and `logical_requested_bytes`
+describe decoder requests before file-scheduler transformation; overlapping
+logical bytes count repeatedly. `logical_union_bytes` counts each requested byte
+once within a scheduler request. `physical_iops` and `physical_bytes` describe
+the ranges submitted after gap coalescing and maximum-IOP splitting, and
+`scheduler_requests` counts input batches to that transformation. These are
+scheduler-requested bytes, not guaranteed wire bytes.
+
+`overfetch_bytes` is the per-request sum of physical bytes minus logical-union
+bytes. `overfetch_ratio` divides that overhead by logical-union bytes, so zero
+means no extra bytes. `coalescing_ratio` divides logical ranges by physical IOPs,
+so values above one mean several logical ranges were served per physical IOP;
+maximum-IOP splitting can produce a value below one. Empty operations report
+zero for both ratios. The span contains scalar values only—never paths, object
+keys, row IDs, or labels.
+
 ## Merge-insert analysis
 
 `MergeInsertJob::analyze_plan_report`, `analyze_plan_report_batches`, and

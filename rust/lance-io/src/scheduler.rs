@@ -1569,7 +1569,7 @@ impl FileScheduler {
 
         self.root.stats.record_request(&updated_requests);
         if let Some(extra_stats) = &self.extra_stats {
-            extra_stats.record_request(&updated_requests);
+            extra_stats.record_request_transform(&request, &updated_requests);
         }
 
         let bytes_vec_fut = self.root.submit_request_with_stats(
@@ -2324,6 +2324,58 @@ mod tests {
         assert_eq!(global.bytes_read + 1000, global_after.bytes_read);
         assert_eq!(scoped.bytes_read, scoped_after.bytes_read);
         assert_eq!(scoped.iops, scoped_after.iops);
+    }
+
+    #[derive(Debug, Default)]
+    struct RangeTransformStats {
+        logical: Mutex<Vec<Range<u64>>>,
+        physical: Mutex<Vec<Range<u64>>>,
+    }
+
+    impl IoStatsRecorder for RangeTransformStats {
+        fn record_request(&self, ranges: &[Range<u64>]) {
+            *self.physical.lock().unwrap() = ranges.to_vec();
+        }
+
+        fn record_request_transform(
+            &self,
+            logical_ranges: &[Range<u64>],
+            physical_ranges: &[Range<u64>],
+        ) {
+            *self.logical.lock().unwrap() = logical_ranges.to_vec();
+            *self.physical.lock().unwrap() = physical_ranges.to_vec();
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_stats_can_observe_logical_to_physical_range_transform() {
+        let path = Path::parse("range-transform").unwrap();
+        let object_store = Arc::new(ObjectStore::memory());
+        object_store.put(&path, &[0_u8; 16 * 1024]).await.unwrap();
+        let scheduler = ScanScheduler::new(
+            object_store,
+            SchedulerConfig {
+                use_lite_scheduler: Some(false),
+                ..SchedulerConfig::default_for_testing()
+            },
+        );
+        let stats = Arc::new(RangeTransformStats::default());
+        let file_scheduler = scheduler
+            .open_file(&path, &CachedFileSize::unknown())
+            .await
+            .unwrap()
+            .with_io_stats(stats.clone());
+
+        file_scheduler
+            .submit_request(vec![0..100, 200..300, 8_000..8_100], 0)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *stats.logical.lock().unwrap(),
+            vec![0..100, 200..300, 8_000..8_100]
+        );
+        assert_eq!(*stats.physical.lock().unwrap(), vec![0..300, 8_000..8_100]);
     }
 
     #[derive(Debug, Default)]
